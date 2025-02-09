@@ -1,49 +1,66 @@
 package singleton
 
 import (
+	_ "embed"
 	"log"
 	"time"
 
 	"github.com/patrickmn/go-cache"
+	"gopkg.in/yaml.v3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
-	"github.com/naiba/nezha/model"
-	"github.com/naiba/nezha/pkg/utils"
+	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/pkg/utils"
 )
 
-var Version = "v0.12.20" // ！！记得修改 README 中的 badge 版本！！
+var Version = "debug"
 
 var (
-	Conf  *model.Config
-	Cache *cache.Cache
-	DB    *gorm.DB
-	Loc   *time.Location
+	Conf              *model.Config
+	Cache             *cache.Cache
+	DB                *gorm.DB
+	Loc               *time.Location
+	FrontendTemplates []model.FrontendTemplate
+	DashboardBootTime = uint64(time.Now().Unix())
 )
 
-// Init 初始化singleton
-func Init() {
-	// 初始化时区至上海 UTF+8
+//go:embed frontend-templates.yaml
+var frontendTemplatesYAML []byte
+
+func InitTimezoneAndCache() {
 	var err error
-	Loc, err = time.LoadLocation("Asia/Shanghai")
+	Loc, err = time.LoadLocation(Conf.Location)
 	if err != nil {
 		panic(err)
 	}
 
-	Conf = &model.Config{}
 	Cache = cache.New(5*time.Minute, 10*time.Minute)
 }
 
 // LoadSingleton 加载子服务并执行
 func LoadSingleton() {
-	LoadNotifications() // 加载通知服务
-	LoadServers()       // 加载服务器列表
-	LoadCronTasks()     // 加载定时任务
+	initUser()          // 加载用户ID绑定表
+	initI18n()          // 加载本地化服务
+	loadNotifications() // 加载通知服务
+	loadServers()       // 加载服务器列表
+	loadCronTasks()     // 加载定时任务
+	initNAT()
+	initDDNS()
+}
+
+// InitFrontendTemplates 从内置文件中加载FrontendTemplates
+func InitFrontendTemplates() {
+	err := yaml.Unmarshal(frontendTemplatesYAML, &FrontendTemplates)
+	if err != nil {
+		panic(err)
+	}
 }
 
 // InitConfigFromPath 从给出的文件路径中加载配置
 func InitConfigFromPath(path string) {
-	err := Conf.Read(path)
+	Conf = &model.Config{}
+	err := Conf.Read(path, FrontendTemplates)
 	if err != nil {
 		panic(err)
 	}
@@ -61,9 +78,11 @@ func InitDBFromPath(path string) {
 	if Conf.Debug {
 		DB = DB.Debug()
 	}
-	err = DB.AutoMigrate(model.Server{}, model.User{},
-		model.Notification{}, model.AlertRule{}, model.Monitor{},
-		model.MonitorHistory{}, model.Cron{}, model.Transfer{})
+	err = DB.AutoMigrate(model.Server{}, model.User{}, model.ServerGroup{}, model.NotificationGroup{},
+		model.Notification{}, model.AlertRule{}, model.Service{}, model.NotificationGroupNotification{},
+		model.ServiceHistory{}, model.Cron{}, model.Transfer{}, model.ServerGroupServer{},
+		model.NAT{}, model.DDNSProfile{}, model.NotificationGroupNotification{},
+		model.WAF{}, model.Oauth2Bind{})
 	if err != nil {
 		panic(err)
 	}
@@ -74,32 +93,36 @@ func RecordTransferHourlyUsage() {
 	ServerLock.Lock()
 	defer ServerLock.Unlock()
 	now := time.Now()
-	nowTrimSeconds := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, time.Local)
+	nowTrimSeconds := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
 	var txs []model.Transfer
 	for id, server := range ServerList {
 		tx := model.Transfer{
 			ServerID: id,
-			In:       server.State.NetInTransfer - uint64(server.PrevHourlyTransferIn),
-			Out:      server.State.NetOutTransfer - uint64(server.PrevHourlyTransferOut),
+			In:       utils.Uint64SubInt64(server.State.NetInTransfer, server.PrevTransferInSnapshot),
+			Out:      utils.Uint64SubInt64(server.State.NetOutTransfer, server.PrevTransferOutSnapshot),
 		}
 		if tx.In == 0 && tx.Out == 0 {
 			continue
 		}
-		server.PrevHourlyTransferIn = int64(server.State.NetInTransfer)
-		server.PrevHourlyTransferOut = int64(server.State.NetOutTransfer)
+		server.PrevTransferInSnapshot = int64(server.State.NetInTransfer)
+		server.PrevTransferOutSnapshot = int64(server.State.NetOutTransfer)
 		tx.CreatedAt = nowTrimSeconds
 		txs = append(txs, tx)
 	}
 	if len(txs) == 0 {
 		return
 	}
-	log.Println("NEZHA>> Cron 流量统计入库", len(txs), DB.Create(txs).Error)
+	log.Printf("NEZHA>> Saved traffic metrics to database. Affected %d row(s), Error: %v", len(txs), DB.Create(txs).Error)
 }
 
-// CleanMonitorHistory 清理无效或过时的 监控记录 和 流量记录
-func CleanMonitorHistory() {
+// CleanServiceHistory 清理无效或过时的 监控记录 和 流量记录
+func CleanServiceHistory() {
 	// 清理已被删除的服务器的监控记录与流量记录
-	DB.Unscoped().Delete(&model.MonitorHistory{}, "created_at < ? OR monitor_id NOT IN (SELECT `id` FROM monitors)", time.Now().AddDate(0, 0, -30))
+	DB.Unscoped().Delete(&model.ServiceHistory{}, "created_at < ? OR service_id NOT IN (SELECT `id` FROM services)", time.Now().AddDate(0, 0, -30))
+	// 由于网络监控记录的数据较多，并且前端仅使用了 1 天的数据
+	// 考虑到 sqlite 数据量问题，仅保留一天数据，
+	// server_id = 0 的数据会用于/service页面的可用性展示
+	DB.Unscoped().Delete(&model.ServiceHistory{}, "(created_at < ? AND server_id != 0) OR service_id NOT IN (SELECT `id` FROM services)", time.Now().AddDate(0, 0, -1))
 	DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (SELECT `id` FROM servers)")
 	// 计算可清理流量记录的时长
 	var allServerKeep time.Time
@@ -113,7 +136,7 @@ func CleanMonitorHistory() {
 			if !rule.IsTransferDurationRule() {
 				continue
 			}
-			dataCouldRemoveBefore := rule.GetTransferDurationStart()
+			dataCouldRemoveBefore := rule.GetTransferDurationStart().UTC()
 			// 判断规则影响的机器范围
 			if rule.Cover == model.RuleCoverAll {
 				// 更新全局可以清理的数据点
@@ -132,12 +155,12 @@ func CleanMonitorHistory() {
 		}
 	}
 	for id, couldRemove := range specialServerKeep {
-		DB.Unscoped().Delete(&model.Transfer{}, "server_id = ? AND created_at < ?", id, couldRemove)
+		DB.Unscoped().Delete(&model.Transfer{}, "server_id = ? AND datetime(`created_at`) < datetime(?)", id, couldRemove)
 	}
 	if allServerKeep.IsZero() {
 		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?)", specialServerIDs)
 	} else {
-		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?) AND created_at < ?", specialServerIDs, allServerKeep)
+		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?) AND datetime(`created_at`) < datetime(?)", specialServerIDs, allServerKeep)
 	}
 }
 

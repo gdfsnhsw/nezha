@@ -1,38 +1,39 @@
 package singleton
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 	"sync"
 
-	"github.com/naiba/nezha/model"
+	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/pkg/utils"
 )
 
 var (
-	ServerList map[uint64]*model.Server // [ServerID] -> model.Server
-	SecretToID map[string]uint64        // [ServerSecret] -> ServerID
-	ServerLock sync.RWMutex
+	ServerList     map[uint64]*model.Server // [ServerID] -> model.Server
+	ServerUUIDToID map[string]uint64        // [ServerUUID] -> ServerID
+	ServerLock     sync.RWMutex
 
-	SortedServerList []*model.Server // 用于存储服务器列表的 slice，按照服务器 ID 排序
-	SortedServerLock sync.RWMutex
+	SortedServerList         []*model.Server // 用于存储服务器列表的 slice，按照服务器 ID 排序
+	SortedServerListForGuest []*model.Server
+	SortedServerLock         sync.RWMutex
 )
 
-// InitServer 初始化 ServerID <-> Secret 的映射
 func InitServer() {
 	ServerList = make(map[uint64]*model.Server)
-	SecretToID = make(map[string]uint64)
+	ServerUUIDToID = make(map[string]uint64)
 }
 
-//LoadServers 加载服务器列表并根据ID排序
-func LoadServers() {
+// loadServers 加载服务器列表并根据ID排序
+func loadServers() {
 	InitServer()
 	var servers []model.Server
 	DB.Find(&servers)
 	for _, s := range servers {
 		innerS := s
-		innerS.Host = &model.Host{}
-		innerS.State = &model.HostState{}
+		model.InitServer(&innerS)
 		ServerList[innerS.ID] = &innerS
-		SecretToID[innerS.Secret] = innerS.ID
+		ServerUUIDToID[innerS.UUID] = innerS.ID
 	}
 	ReSortServer()
 }
@@ -44,16 +45,29 @@ func ReSortServer() {
 	SortedServerLock.Lock()
 	defer SortedServerLock.Unlock()
 
-	SortedServerList = []*model.Server{}
-	for _, s := range ServerList {
-		SortedServerList = append(SortedServerList, s)
-	}
-
+	SortedServerList = utils.MapValuesToSlice(ServerList)
 	// 按照服务器 ID 排序的具体实现（ID越大越靠前）
-	sort.SliceStable(SortedServerList, func(i, j int) bool {
-		if SortedServerList[i].DisplayIndex == SortedServerList[j].DisplayIndex {
-			return SortedServerList[i].ID < SortedServerList[j].ID
+	slices.SortStableFunc(SortedServerList, func(a, b *model.Server) int {
+		if a.DisplayIndex == b.DisplayIndex {
+			return cmp.Compare(a.ID, b.ID)
 		}
-		return SortedServerList[i].DisplayIndex > SortedServerList[j].DisplayIndex
+		return cmp.Compare(b.DisplayIndex, a.DisplayIndex)
 	})
+
+	SortedServerListForGuest = make([]*model.Server, 0, len(SortedServerList))
+	for _, s := range SortedServerList {
+		if !s.HideForGuest {
+			SortedServerListForGuest = append(SortedServerListForGuest, s)
+		}
+	}
+}
+
+func OnServerDelete(sid []uint64) {
+	ServerLock.Lock()
+	defer ServerLock.Unlock()
+	for _, id := range sid {
+		serverUUID := ServerList[id].UUID
+		delete(ServerUUIDToID, serverUUID)
+		delete(ServerList, id)
+	}
 }
